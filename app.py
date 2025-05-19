@@ -3,23 +3,14 @@ import numpy as np
 import os
 import joblib
 import lightgbm as lgb
+from sklearn.feature_extraction.text import CountVectorizer
 
-# Set page configuration
 st.set_page_config(
     page_title="IELTS Essay Grader",
     page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Check if transformers and torch are available
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModel
-    BERT_AVAILABLE = True
-except ImportError:
-    BERT_AVAILABLE = False
-    st.warning("BERT models not available. Using simplified grading model.")
 
 # Load model components
 @st.cache_resource
@@ -37,67 +28,111 @@ def load_models():
     pca_model = joblib.load(pca_path)
     lgb_model = lgb.Booster(model_file=lgb_path)
     
-    # Load BERT components if available
-    if BERT_AVAILABLE:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-            bert_model = AutoModel.from_pretrained('bert-base-uncased')
-            bert_model.eval()
-            return tfidf_vectorizer, scaler, pca_model, lgb_model, tokenizer, bert_model, True
-        except Exception as e:
-            st.error(f"Failed to load BERT model: {e}")
-            return tfidf_vectorizer, scaler, pca_model, lgb_model, None, None, False
-    else:
-        return tfidf_vectorizer, scaler, pca_model, lgb_model, None, None, False
+    # Get expected feature dimensions from scaler
+    expected_features = scaler.mean_.shape[0]
+    
+    return tfidf_vectorizer, scaler, pca_model, lgb_model, expected_features
+
+def extract_basic_features(essay_text):
+    """Extract basic textual features from the essay."""
+    words = essay_text.split()
+    sentences = essay_text.split('.')
+    
+    # Length features
+    word_count = len(words)
+    sentence_count = max(1, len([s for s in sentences if s.strip()]))
+    avg_words_per_sentence = word_count / sentence_count
+    
+    # Vocabulary features
+    unique_words = len(set([w.lower() for w in words]))
+    lexical_diversity = unique_words / max(1, word_count)
+    
+    # Word length features
+    avg_word_length = sum(len(w) for w in words) / max(1, word_count)
+    long_words = sum(1 for w in words if len(w) > 6)
+    
+    # Paragraph features
+    paragraphs = essay_text.split('\n\n')
+    paragraph_count = len([p for p in paragraphs if p.strip()])
+    
+    return np.array([
+        word_count, 
+        sentence_count, 
+        avg_words_per_sentence,
+        unique_words,
+        lexical_diversity,
+        avg_word_length,
+        long_words,
+        paragraph_count
+    ])
 
 def process_essay(essay_text, models):
-    """Process an essay and predict its score"""
-    tfidf_vectorizer, scaler, pca_model, lgb_model, tokenizer, bert_model, bert_available = models
-    
-    # Generate BERT embedding if available
-    if bert_available:
-        with torch.no_grad():
-            inputs = tokenizer(essay_text, return_tensors='pt', truncation=True, 
-                             padding=True, max_length=128)
-            outputs = bert_model(**inputs)
-            cls_embedding = outputs.last_hidden_state[:, 0, :].squeeze().numpy()
-            bert_features = np.array([cls_embedding])
-    else:
-        # Use placeholder zeros array for BERT features if not available
-        # Adjust the size to match your expected BERT embedding dimensions (usually 768)
-        bert_features = np.zeros((1, 768))
+    """Process essay to match the expected feature dimensions and predict score."""
+    tfidf_vectorizer, scaler, pca_model, lgb_model, expected_features = models
     
     # Generate TF-IDF features
     tfidf_features = tfidf_vectorizer.transform([essay_text]).toarray()
     
+    # Extract basic features
+    basic_features = extract_basic_features(essay_text).reshape(1, -1)
+    
     try:
-        # Combine features
-        combined_features = np.concatenate([bert_features, tfidf_features], axis=1)
+        # Create placeholder for BERT embeddings (zeros)
+        # The expected dimension is (expected_features - tfidf_features.shape[1] - basic_features.shape[1])
+        bert_dim = max(0, expected_features - tfidf_features.shape[1] - basic_features.shape[1])
+        bert_placeholder = np.zeros((1, bert_dim))
         
-        # Standardize
-        combined_features = scaler.transform(combined_features)
+        # Combine features to match expected dimensions
+        combined_features = np.hstack([bert_placeholder, basic_features, tfidf_features[:, :max(0, expected_features - bert_dim - basic_features.shape[1])]])
+        
+        # Ensure we have exactly the expected number of features
+        if combined_features.shape[1] > expected_features:
+            combined_features = combined_features[:, :expected_features]
+        elif combined_features.shape[1] < expected_features:
+            # Pad with zeros if needed
+            padding = np.zeros((1, expected_features - combined_features.shape[1]))
+            combined_features = np.hstack([combined_features, padding])
+        
+        # Apply scaling
+        scaled_features = scaler.transform(combined_features)
         
         # Apply PCA
-        reduced_features = pca_model.transform(combined_features)
+        reduced_features = pca_model.transform(scaled_features)
         
         # Predict using LightGBM model
         prediction = lgb_model.predict(reduced_features)[0]
         
         # Round to nearest 0.5 for IELTS-style scoring
         return round(prediction * 2) / 2
+        
     except Exception as e:
-        st.error(f"Error processing essay: {e}")
-        # Fallback to a simpler prediction method based on essay length
-        # This is a very simplistic backup method
-        words = len(essay_text.split())
-        if words < 100:
-            return 4.0
-        elif words < 200:
-            return 5.0
-        elif words < 300:
-            return 6.0
-        else:
-            return 6.5
+        st.error(f"Error in feature processing: {str(e)}")
+        # Fall back to rule-based scoring
+        return rule_based_score(essay_text)
+
+def rule_based_score(essay_text):
+    """A simplified rule-based scoring method as fallback."""
+    words = len(essay_text.split())
+    
+    # Base score
+    if words < 100:
+        score = 4.0
+    elif words < 200:
+        score = 5.0
+    elif words < 250:
+        score = 5.5
+    elif words < 300:
+        score = 6.0
+    else:
+        score = 6.5
+    
+    # Adjust for paragraph structure
+    paragraphs = [p for p in essay_text.split('\n\n') if p.strip()]
+    if len(paragraphs) >= 4:
+        score += 0.5
+        
+    # Cap at 7.5 for the fallback method
+    return min(7.5, score)
 
 def get_band_description(score):
     """Return band description based on score"""
@@ -133,13 +168,46 @@ def get_band_description(score):
         You have great difficulty understanding written English and conveying meaning even in simple contexts.
         """
 
+def get_feedback(essay_text, score):
+    """Generate specific feedback based on the essay and score."""
+    word_count = len(essay_text.split())
+    
+    feedback = []
+    
+    # Length feedback
+    if word_count < 250:
+        feedback.append("📏 **Length**: Your essay is shorter than the recommended 250-word minimum. Try to develop your ideas more fully.")
+    elif word_count > 350:
+        feedback.append("📏 **Length**: Your essay is quite long. While this isn't necessarily a problem, make sure you're not sacrificing quality for quantity.")
+    else:
+        feedback.append("📏 **Length**: Good essay length that meets IELTS requirements.")
+    
+    # Paragraph structure
+    paragraphs = [p for p in essay_text.split('\n\n') if p.strip()]
+    if len(paragraphs) < 4:
+        feedback.append("📄 **Structure**: Consider using more paragraphs. A typical IELTS essay has at least 4: introduction, 2+ body paragraphs, and conclusion.")
+    else:
+        feedback.append("📄 **Structure**: Good paragraph structure with clear organization.")
+    
+    # Based on score bands
+    if score >= 7.0:
+        feedback.append("🌟 **Overall**: Your essay demonstrates good command of English with effective organization and development of ideas.")
+    elif score >= 6.0:
+        feedback.append("✅ **Overall**: Your essay shows competent use of English with generally clear organization, though there may be occasional errors or underdeveloped points.")
+    elif score >= 5.0:
+        feedback.append("⚠️ **Overall**: Your essay communicates basic ideas but needs improvement in language accuracy, vocabulary range, and development of arguments.")
+    else:
+        feedback.append("⚠️ **Overall**: Your essay needs significant improvement in organization, language accuracy, and idea development.")
+    
+    return feedback
+
 def main():
     # Load models (cached by Streamlit)
     with st.spinner("Loading models... (this may take a moment on first run)"):
         try:
             models = load_models()
         except Exception as e:
-            st.error(f"Error loading models: {e}")
+            st.error(f"Error loading models: {str(e)}")
             st.stop()
     
     # Header area
@@ -210,13 +278,16 @@ In conclusion, while climate change presents a daunting challenge, it also offer
                     try:
                         score = process_essay(essay_text, models)
                         band_name, band_desc = get_band_description(score)
+                        feedback = get_feedback(essay_text, score)
                         
-                        # Create expandable results section
+                        # Store in session state
                         st.session_state.score = score
                         st.session_state.band_name = band_name
                         st.session_state.band_desc = band_desc
+                        st.session_state.feedback = feedback
                     except Exception as e:
-                        st.error(f"Error analyzing essay: {e}")
+                        st.error(f"Error analyzing essay: {str(e)}")
+                        st.session_state.error = str(e)
     
     with col2:
         # Display results if available
@@ -233,6 +304,11 @@ In conclusion, while climate change presents a daunting challenge, it also offer
             # Display band description
             st.markdown("#### Band Description")
             st.markdown(st.session_state.band_desc)
+            
+            # Display specific feedback
+            st.markdown("#### Specific Feedback")
+            for item in st.session_state.feedback:
+                st.markdown(item)
             
     # Add footer
     st.markdown("---")
